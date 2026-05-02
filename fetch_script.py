@@ -198,32 +198,48 @@ def download_xjtu_file():
             
             print(f"[*] 发现资源: {file_name}，正在解析下载直链...")
             
-            # 步骤 C：通过预览接口换取媒体直链
-            preview_api = f"{base_url}/api/uploads/{file_id}/preview"
-            prev_resp = requests.get(
-                preview_api,
-                cookies=cookies,
-                headers=headers,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-            )
-
-            print(f"[*] 预览接口响应: {prev_resp.status_code} {prev_resp.headers.get('Content-Type', '')}")
             real_url = None
-            if prev_resp.status_code == 200:
-                try:
-                    preview_data = prev_resp.json()
-                    real_url = (
-                        preview_data.get("url")
-                        or preview_data.get("link")
-                        or preview_data.get("redirect_url")
-                    )
-                except ValueError:
-                    print("[-] 预览接口未返回 JSON，跳过直链解析。")
-            
-            # 如果预览接口没给 URL，尝试备选下载接口
-            if not real_url:
-                real_url = f"{base_url}/api/attachments/{file_info.get('reference_id')}/download"
-                print(f"[*] 预览接口未提供直链，尝试备选接口: {real_url}")
+            # 针对 Office 文档（Word, Excel, PPT 等）直接使用下载接口，避免因服务器端转换为 PDF 导致格式/字体错乱
+            office_extensions = ('.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx')
+            if file_name.lower().endswith(office_extensions):
+                url_api = f"{base_url}/api/uploads/{file_id}/url"
+                print(f"[*] 检测到 Office 文档，请求原文件直链: {url_api}")
+                url_resp = requests.get(url_api, cookies=cookies, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+                if url_resp.status_code == 200:
+                    try:
+                        real_url = url_resp.json().get("url")
+                    except ValueError:
+                        pass
+                
+                if not real_url:
+                    print("[-] 获取直链失败，回退到备用 blob 下载流")
+                    real_url = f"{base_url}/api/uploads/{file_id}/blob"
+            else:
+                # 步骤 C：通过预览接口换取媒体直链
+                preview_api = f"{base_url}/api/uploads/{file_id}/preview"
+                prev_resp = requests.get(
+                    preview_api,
+                    cookies=cookies,
+                    headers=headers,
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                )
+    
+                print(f"[*] 预览接口响应: {prev_resp.status_code} {prev_resp.headers.get('Content-Type', '')}")
+                if prev_resp.status_code == 200:
+                    try:
+                        preview_data = prev_resp.json()
+                        real_url = (
+                            preview_data.get("url")
+                            or preview_data.get("link")
+                            or preview_data.get("redirect_url")
+                        )
+                    except ValueError:
+                        print("[-] 预览接口未返回 JSON，跳过直链解析。")
+                
+                # 如果预览接口没给 URL，尝试备选下载接口
+                if not real_url:
+                    real_url = f"{base_url}/api/attachments/{file_info.get('reference_id')}/download"
+                    print(f"[*] 预览接口未提供直链，尝试备选接口: {real_url}")
 
             # 步骤 D：执行二进制流下载
             print(f"[+] 正在下载...")

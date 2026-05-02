@@ -24,6 +24,25 @@
         console.log(`%c📦 发现 ${uploads.length} 个资源，正在破解下载链接...`, "color: #17a2b8;");
 
         for (let file of uploads) {
+            // 如果是 Office 文档文件（Word, Excel, PPT 等），直接尝试原文件下载以避免转换为 PDF 导致的字体失效问题
+            const officeDocsRegex = /\.(doc|docx|ppt|pptx|xls|xlsx)$/i;
+            if (file.name && file.name.match(officeDocsRegex)) {
+                console.log(`%c✨ 检测到 Office 文档: ${file.name}，正在获取原文件直链...`, "color: #ffc107; font-weight: bold;");
+                const urlCheck = await fetch(`/api/uploads/${file.id}/url`);
+                if (urlCheck.ok) {
+                    const urlData = await urlCheck.json();
+                    if (urlData.url) {
+                        console.log("🔗 原文件直链: ", urlData.url);
+                        window.open(urlData.url, '_blank');
+                        continue;
+                    }
+                }
+                // 如果 /url 接口没有返回有效的 url，则使用备用方案直接下载文件流
+                console.log("🔗 尝试备选文件流下载...");
+                window.open(`/api/uploads/${file.id}/blob`, '_blank');
+                continue;
+            }
+
             // 尝试通过预览接口获取 CDN 真实地址
             const previewPath = `/api/uploads/${file.id}/preview`;
             const check = await fetch(previewPath);
