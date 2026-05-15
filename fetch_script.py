@@ -8,6 +8,7 @@ import requests
 
 # ================= 配置区 =================
 # 1. 想要下载的活动 URL (直接从浏览器地址栏复制)
+# 形式示例：https://lms.xjtu.edu.cn/course/{class_number}/learning-activity#/{activity_id}
 TARGET_URL = "https://lms.xjtu.edu.cn/course/{class_number}/learning-activity#/{activity_id}"
 
 # 2. 本地存储文件夹
@@ -17,6 +18,12 @@ READ_TIMEOUT = 30
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 PROGRESS_INTERVAL_SECONDS = 1.0
 # ==========================================
+
+AUTH_PAGE_MARKERS = (
+    "统一身份认证网关",
+    "Login - 西安交通大学统一身份认证网关",
+    "casLoginForm",
+)
 
 def iter_firefox_cookie_files():
     """Return all readable Firefox cookie databases under the current user."""
@@ -57,7 +64,7 @@ def get_universal_cookies():
             cookies = list(cj)
             if cookies:
                 print(f"[+] 已从 {browser_name} 加载 {len(cookies)} 条 xjtu.edu.cn Cookie")
-                return cj
+                return browser_name, cj
             errors.append(f"{browser_name}: 未找到 xjtu.edu.cn Cookie")
         except Exception as e:
             errors.append(f"{browser_name}: {e}")
@@ -68,7 +75,65 @@ def get_universal_cookies():
         print("    已尝试的浏览器/配置：")
         for item in errors:
             print(f"    - {item}")
-    return None
+    return None, None
+
+
+def create_session_from_cookies(cookie_jar, headers):
+    """Create a requests session and persist browser cookies into it."""
+    session = requests.Session()
+    session.headers.update(headers)
+    for cookie in cookie_jar:
+        session.cookies.set_cookie(cookie)
+    return session
+
+
+def is_auth_login_page(response):
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "html" not in content_type:
+        return False
+
+    snippet = response.text[:4000]
+    return any(marker in snippet for marker in AUTH_PAGE_MARKERS)
+
+
+def ensure_lms_session(session, course_id, browser_name):
+    """
+    Touch LMS pages first so an existing SSO session can re-issue LMS cookies.
+    If the SSO gateway now requires fresh MFA, fail fast with a clear hint.
+    """
+    warmup_urls = [
+        "https://lms.xjtu.edu.cn/",
+        f"https://lms.xjtu.edu.cn/course/{course_id}",
+        TARGET_URL.split("#", 1)[0],
+    ]
+
+    for warmup_url in warmup_urls:
+        try:
+            print(f"[*] 正在预热 LMS 登录态: {warmup_url}")
+            response = session.get(
+                warmup_url,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                allow_redirects=True,
+            )
+            print(
+                f"[*] 预热结果: {response.status_code} "
+                f"{response.headers.get('Content-Type', '')} -> {response.url}"
+            )
+        except requests.RequestException as exc:
+            print(f"[-] 预热 LMS 登录态失败: {exc}")
+            continue
+
+        if is_auth_login_page(response):
+            print("[-] 当前会话被统一认证网关拦截，说明需要重新完成登录/两步验证。")
+            print(f"    当前脚本复用的 Cookie 来源: {browser_name}")
+            print(f"    请先在同一浏览器配置中打开并确认可以正常访问: {TARGET_URL}")
+            print("    完成登录和两步验证后，再重新运行脚本即可。")
+            return False
+
+        if response.ok:
+            return True
+
+    return True
 
 def sanitize_filename(filename):
     """清理文件名中的非法字符"""
@@ -84,15 +149,13 @@ def format_bytes(num_bytes):
         value /= 1024
 
 
-def download_file(url, file_path, cookies, headers):
+def download_file(url, file_path, session):
     temp_path = f"{file_path}.part"
     last_report_time = time.time()
     downloaded = 0
 
-    with requests.get(
+    with session.get(
         url,
-        cookies=cookies,
-        headers=headers,
         stream=True,
         timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
     ) as response:
@@ -149,7 +212,7 @@ def download_xjtu_file():
     base_url = "https://lms.xjtu.edu.cn"
     
     # 2. 获取 Cookie
-    cookies = get_universal_cookies()
+    browser_name, cookies = get_universal_cookies()
     if not cookies:
         return
 
@@ -157,24 +220,31 @@ def download_xjtu_file():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": TARGET_URL
     }
+    session = create_session_from_cookies(cookies, headers)
 
     if not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR)
 
     try:
+        if not ensure_lms_session(session, course_id, browser_name):
+            return
+
         # 步骤 A：获取活动元数据
         print(f"[*] 正在连接活动接口: {activity_id}...")
         api_url = f"{base_url}/api/activities/{activity_id}"
-        resp = requests.get(
+        resp = session.get(
             api_url,
-            cookies=cookies,
-            headers=headers,
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
         )
 
         print(f"[*] 活动接口响应: {resp.status_code} {resp.headers.get('Content-Type', '')}")
         if resp.status_code != 200:
             print(f"[-] 访问失败，状态码: {resp.status_code}。请确认是否已在浏览器登录。")
+            return
+
+        if is_auth_login_page(resp):
+            print("[-] 活动接口仍然返回统一认证登录页，当前登录态无法直接访问 LMS API。")
+            print(f"    请在 {browser_name} 对应的同一浏览器配置中重新完成登录和两步验证后重试。")
             return
 
         try:
@@ -204,7 +274,7 @@ def download_xjtu_file():
             if file_name.lower().endswith(office_extensions):
                 url_api = f"{base_url}/api/uploads/{file_id}/url"
                 print(f"[*] 检测到 Office 文档，请求原文件直链: {url_api}")
-                url_resp = requests.get(url_api, cookies=cookies, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+                url_resp = session.get(url_api, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
                 if url_resp.status_code == 200:
                     try:
                         real_url = url_resp.json().get("url")
@@ -217,10 +287,8 @@ def download_xjtu_file():
             else:
                 # 步骤 C：通过预览接口换取媒体直链
                 preview_api = f"{base_url}/api/uploads/{file_id}/preview"
-                prev_resp = requests.get(
+                prev_resp = session.get(
                     preview_api,
-                    cookies=cookies,
-                    headers=headers,
                     timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                 )
     
@@ -244,7 +312,7 @@ def download_xjtu_file():
             # 步骤 D：执行二进制流下载
             print(f"[+] 正在下载...")
             file_path = os.path.join(SAVE_DIR, file_name)
-            download_file(real_url, file_path, cookies, headers)
+            download_file(real_url, file_path, session)
 
     except Exception as e:
         print(f"[X] 运行出错: {e}")
